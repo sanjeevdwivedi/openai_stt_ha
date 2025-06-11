@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterable
 import io
 import logging
+import struct
 import wave
 
 import httpx
@@ -25,22 +26,9 @@ from homeassistant.helpers.httpx_client import get_async_client
 _LOGGER = logging.getLogger(__name__)
 
 
-CONF_API_KEY = "api_key"
 CONF_API_URL = "api_url"
-CONF_MODEL = "model"
-CONF_PROMPT = "prompt"
-CONF_TEMP = "temperature"
 
-DEFAULT_API_URL = "https://api.openai.com/v1"
-DEFAULT_MODEL = "gpt-4o-mini-transcribe"
-DEFAULT_PROMPT = ""
-DEFAULT_TEMP = 0
-
-SUPPORTED_MODELS = [
-    "whisper-1",
-    "gpt-4o-mini-transcribe",
-    "gpt-4o-transcribe",
-]
+DEFAULT_API_URL = "http://sanjeev-debian-llm-vm:9000"
 
 SUPPORTED_LANGUAGES = [
     "af",
@@ -102,42 +90,56 @@ SUPPORTED_LANGUAGES = [
     "cy",
 ]
 
-MODEL_SCHEMA = vol.In(SUPPORTED_MODELS)
-
 PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_API_KEY): cv.string,
         vol.Optional(CONF_API_URL, default=DEFAULT_API_URL): cv.string,
-        vol.Optional(CONF_MODEL, default=DEFAULT_MODEL): MODEL_SCHEMA,
-        vol.Optional(CONF_PROMPT, default=DEFAULT_PROMPT): cv.string,
-        vol.Optional(CONF_TEMP, default=DEFAULT_TEMP): cv.positive_int,
     }
 )
 
 
 async def async_get_engine(hass, config, discovery_info=None):
-    """Set up the OpenAI STT component."""
-    api_key = config[CONF_API_KEY]
+    """Set up the Local Whisper STT component."""
     api_url = config.get(CONF_API_URL, DEFAULT_API_URL)
-    model = config.get(CONF_MODEL, DEFAULT_MODEL)
-    prompt = config.get(CONF_PROMPT, DEFAULT_PROMPT)
-    temperature = config.get(CONF_TEMP, DEFAULT_TEMP)
-    return OpenAISTTProvider(hass, api_key, api_url, model, prompt, temperature)
+    return LocalWhisperSTTProvider(hass, api_url)
 
 
-class OpenAISTTProvider(Provider):
-    """The OpenAI STT provider."""
+def convert_pcm_to_wav(pcm_data: bytes, sample_rate: int = 16000, channels: int = 1, sample_width: int = 2) -> bytes:
+    """Convert raw PCM audio data to WAV format"""
+    # WAV file header
+    wav_buffer = io.BytesIO()
+    
+    # Calculate sizes
+    data_size = len(pcm_data)
+    file_size = 36 + data_size
+    
+    # Write WAV header
+    wav_buffer.write(b'RIFF')  # ChunkID
+    wav_buffer.write(struct.pack('<I', file_size))  # ChunkSize
+    wav_buffer.write(b'WAVE')  # Format
+    wav_buffer.write(b'fmt ')  # Subchunk1ID
+    wav_buffer.write(struct.pack('<I', 16))  # Subchunk1Size (PCM = 16)
+    wav_buffer.write(struct.pack('<H', 1))   # AudioFormat (PCM = 1)
+    wav_buffer.write(struct.pack('<H', channels))  # NumChannels
+    wav_buffer.write(struct.pack('<I', sample_rate))  # SampleRate
+    wav_buffer.write(struct.pack('<I', sample_rate * channels * sample_width))  # ByteRate
+    wav_buffer.write(struct.pack('<H', channels * sample_width))  # BlockAlign
+    wav_buffer.write(struct.pack('<H', sample_width * 8))  # BitsPerSample
+    wav_buffer.write(b'data')  # Subchunk2ID
+    wav_buffer.write(struct.pack('<I', data_size))  # Subchunk2Size
+    wav_buffer.write(pcm_data)  # Data
+    
+    return wav_buffer.getvalue()
 
-    def __init__(self, hass, api_key, api_url, model, prompt, temperature) -> None:
-        """Init OpenAI STT service."""
+
+class LocalWhisperSTTProvider(Provider):
+    """The Local Whisper STT provider."""
+
+    def __init__(self, hass, api_url) -> None:
+        """Init Local Whisper STT service."""
         self.hass = hass
-        self.name = "OpenAI STT"
+        self.name = "Local Whisper STT"
 
-        self._api_key = api_key
         self._api_url = api_url
-        self._model = model
-        self._prompt = prompt
-        self._temperature = temperature
         self._client = get_async_client(hass)
 
     @property
@@ -184,55 +186,61 @@ class OpenAISTTProvider(Provider):
 
         _LOGGER.debug("Audio data size: %d bytes", len(audio_data))
 
-        # Convert audio data to the correct format
-        wav_stream = io.BytesIO()
-
-        with wave.open(wav_stream, "wb") as wf:
-            wf.setnchannels(metadata.channel)
-            wf.setsampwidth(metadata.bit_rate // 8)
-            wf.setframerate(metadata.sample_rate)
-            wf.writeframes(audio_data)
-
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-        }
-
-        files = {
-            "file": ("whisper_audio.wav", wav_stream.getvalue(), "audio/wav"),
-            "model": (None, self._model),
-            "language": (None, metadata.language),
-            "prompt": (None, self._prompt),
-            "temperature": (None, str(self._temperature)),
-            "response_format": (None, "json"),
-        }
-
-        url = f"{self._api_url}/audio/transcriptions"
-
-        _LOGGER.debug("Sending request to API: %s", url)
-
         try:
+            # Convert PCM to WAV format
+            wav_audio = convert_pcm_to_wav(
+                audio_data, 
+                sample_rate=metadata.sample_rate, 
+                channels=metadata.channel, 
+                sample_width=metadata.bit_rate // 8
+            )
+
+            # Prepare form data
+            files = {
+                'audio_file': ('recording.wav', wav_audio, 'audio/wav')
+            }
+
+            params = {
+                'encode': 'true',
+                'task': 'transcribe',
+                'output': 'txt'
+            }
+
+            url = f"{self._api_url}/asr"
+            headers = {'Accept': 'text/plain'}
+
+            _LOGGER.debug("Sending request to API: %s", url)
+
             # Send the request to the API
             response = await self._client.post(
                 url,
-                headers=headers,
+                params=params,
                 files=files,
-                timeout=httpx.Timeout(10.0),
+                headers=headers,
+                timeout=httpx.Timeout(30.0),
             )
             response.raise_for_status()
-            result = response.json()
-            _LOGGER.debug("API response: %s", result)
+            
+            transcribed_text = response.text
+            _LOGGER.debug("API response: %s", transcribed_text)
+            
+            if not transcribed_text or not transcribed_text.strip():
+                _LOGGER.warning("Transcription returned empty text")
+                return SpeechResult("", SpeechResultState.ERROR)
+                
+            return SpeechResult(transcribed_text.strip(), SpeechResultState.SUCCESS)
+
         except httpx.HTTPError as err:
             if hasattr(err, "response") and err.response:
+                error_text = await err.response.atext()
                 _LOGGER.error(
                     "HTTP error %s: %s",
                     err.response.status_code,
-                    err.response.json()["error"]["message"],
+                    error_text,
                 )
             else:
                 _LOGGER.error("HTTP error: %s", err)
             return SpeechResult("", SpeechResultState.ERROR)
         except Exception as err:
-            _LOGGER.error("Error: %s", err)
+            _LOGGER.error("Error during transcription: %s", err)
             return SpeechResult("", SpeechResultState.ERROR)
-
-        return SpeechResult(result["text"], SpeechResultState.SUCCESS)

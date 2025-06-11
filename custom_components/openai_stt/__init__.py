@@ -1,1 +1,1 @@
-""" Custom integration for OpenAI Whisper STT API."""
+""" Custom integration for Local Whisper STT API."""

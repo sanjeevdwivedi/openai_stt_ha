@@ -1,4 +1,4 @@
-# OpenAI Speech-To-Text for Home Assistant
+#Sanjeev OpenAI Speech-To-Text for Home Assistant
 
 This custom component integrates [OpenAI Speech-to-Text](https://platform.openai.com/docs/guides/speech-to-text), also known as Whisper, into Home Assistant via the OpenAI API for use in the Assist pipeline.
 
